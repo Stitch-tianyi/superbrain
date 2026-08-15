@@ -9,3 +9,6 @@ node_modules/
 # 日志 / 临时
 *.log
 *.tmp
+
+# 本地归档旧版（不纳入版本控制，仅本地留档）
+superbrain-p01-v2.archive.html
