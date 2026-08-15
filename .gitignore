@@ -1,0 +1,11 @@
+# 系统 / 编辑器缓存
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 依赖（本地演示无需提交）
+node_modules/
+
+# 日志 / 临时
+*.log
+*.tmp

@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>超级智脑 · 企业经营导航首页</title>
+
+  <!-- 图表库（ECharts，CDN 引入；生产环境可改为本地/私有源） -->
+  <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
+
+  <!-- 全局样式（所有 CSS 统一放在 styles.css，不再内联） -->
+  <link rel="stylesheet" href="assets/styles.css">
+</head>
+<body>
+  <!-- 应用挂载点：整个界面由 JS 渲染到该容器内 -->
+  <div class="app" id="app"></div>
+
+  <!-- KPI 悬浮解释层（鼠标悬停右上角 ? 时显示「人话解释/公式/数字代入/口径」） -->
+  <div class="kpi-tooltip" id="kpiTooltip"></div>
+
+  <!-- 全局轻提示层（toast） -->
+  <div class="toast" id="toast"></div>
+
+  <!--
+    应用入口（ES Module）。
+    app.js 内部通过 import 自动加载 api / render / charts / data，
+    无需在此逐个列出脚本。注意：ES Module 需通过 http(s) 访问，
+    直接双击以 file:// 打开会被浏览器拦截，需用本地服务器预览。
+  -->
+  <script type="module" src="assets/js/app.js"></script>
+</body>
+</html>
