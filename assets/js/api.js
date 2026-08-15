@@ -8,10 +8,28 @@
 //                 渲染层与图表层无需任何改动（字段结构保持一致即可）。
 // =============================================================
 
-import { DASHBOARD } from './data.js';
+import { DASHBOARD, NAVIGATION_ITEMS } from './data.js';
 
 /** 后端接口前缀（部署时配置；开发演示阶段为空，走本地 Mock） */
 const API_BASE = '/api';
+
+/**
+ * 获取全部经营导航事项（Navigation Item 集合）
+ * @returns {Array} 与 data.js/NAVIGATION_ITEMS 相同结构
+ */
+export async function getNavigationItems() {
+  return NAVIGATION_ITEMS;
+}
+
+/**
+ * 获取指定（或默认首个）经营导航事项
+ * @param {string} [id]
+ * @returns {object|null}
+ */
+export async function getNavigationItem(id) {
+  if (!id) return NAVIGATION_ITEMS[0] || null;
+  return NAVIGATION_ITEMS.find(n => n.id === id) || null;
+}
 
 /**
  * 获取 P01 首页全部数据

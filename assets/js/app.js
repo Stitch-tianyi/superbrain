@@ -9,9 +9,10 @@
 // 本文件不存放业务数据，也不写死页面结构。
 // =============================================================
 
-import { getDashboard } from './api.js';
+import { getDashboard, getNavigationItem } from './api.js';
 import { sidebarHtml, ctxBarHtml, renderPage } from './render.js';
 import { initCharts, resizeCharts } from './charts.js';
+import { selectHomeHero, selectHomeEffect, selectHomeQueue, selectHomeDecisions } from './selectors.js';
 
 // -------------------------------------------------------------
 // 应用状态
@@ -111,7 +112,22 @@ window.addEventListener('resize', () => {
 // -------------------------------------------------------------
 async function bootstrap() {
   try {
-    state.data = await getDashboard();
+    const dashboard = await getDashboard();
+    const ni = await getNavigationItem();   // 默认取 NI-001（canonical）
+
+    // 装配页面数据：
+    // - 企业经营地图 / 全局 KPI / 全国数据 → 直接来自 Dashboard；
+    // - 首屏 Hero / 行动效果 / 导航队列队首（NI-001 部分）→ 由 Selector 从
+    //   Navigation Item 唯一真相源投影，杜绝在 hero/effectChain/navQueue 重复维护；
+    // - 等待决策 → 来自 Dashboard 决策数据（非 NI 复制状态）。
+    state.data = {
+      ...dashboard,
+      hero: selectHomeHero(ni),
+      effectChain: selectHomeEffect(ni),
+      navQueue: selectHomeQueue(ni, dashboard),
+      decisions: selectHomeDecisions(ni, dashboard)
+    };
+
     renderApp();
   } catch (err) {
     console.error('首页数据加载失败：', err);

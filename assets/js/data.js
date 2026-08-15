@@ -7,6 +7,13 @@
 //      api.js 只需返回相同结构的真实数据，渲染层 / 图表层无需改动。
 //   3. 页面逻辑（render.js / charts.js / app.js）一律不写死业务数值，
 //      全部从这里取数，方便后端对接与替换。
+//
+// 本阶段新增：
+//   4. NAVIGATION_ITEMS 是「经营导航事项（Navigation Item）」的唯一真相源
+//      （Single Source of Truth）。P01 / P05 / P06 都只是它的不同 Projection，
+//      绝不允许在 hero / effectChain / navQueue 等处再复制一份 NI 状态。
+//   5. DASHBOARD 保留「企业经营地图 / 全局 KPI / 全国经营数据」等
+//      不属于单个 Navigation Item 的 Dashboard 级数据。
 // =============================================================
 
 /**
@@ -42,7 +49,274 @@ export const LIGHT_PAGES = {
   P10: { n: '系统管理',   lead: '组织/用户权限、基础配置、自动化授权政策与审计。' }
 };
 
-/** P01 首页全部数据 */
+// =============================================================
+// 经营导航事项 · 唯一真相源（Navigation Item Single Source of Truth）
+// -------------------------------------------------------------
+// 这是本阶段的核心。后续 P01 / P05 / P06 都只是它的投影。
+//
+// 设计要点（硬约束）：
+//   - 同一个经营事项只有一份 canonical state；
+//   - 历史不覆盖：Judgment V1 → V2 共存、Route A → B 共存、Result 用数组；
+//   - 两个人工确认（确认路线 / 确认派发）是两个独立 humanDecision 记录；
+//   - currentWorkState 永远只有五种之一（见 WORK_STATES）；
+//   - activeRouteId 在当前阶段仍指向 Route A（Route B 仅 RECOMMENDED）。
+// =============================================================
+
+/** 五态（P06 工作态）冻结定义：永远只有这五个 */
+export const WORK_STATES = {
+  ANALYSIS:              { code: 'ANALYSIS',              label: '分析判断态' },
+  ROUTE_CONFIRMATION:    { code: 'ROUTE_CONFIRMATION',    label: '经营路线确认态' },
+  EXECUTION_PREPARATION: { code: 'EXECUTION_PREPARATION', label: '执行准备态' },
+  ORGANIZATION_EXECUTION:{ code: 'ORGANIZATION_EXECUTION',label: '组织执行态' },
+  RESULT_REVIEW:         { code: 'RESULT_REVIEW',         label: '结果观察 / 改道态' }
+};
+
+/**
+ * 经营航迹里程碑类型（仅记录“经营级里程碑”，普通操作不计入）
+ * 每个 type 对应中文标签，供 buildJourney 投影使用。
+ */
+export const MILESTONE_TYPES = {
+  SIGNAL_DISCOVERED:   '经营信号发现',
+  JUDGMENT_CREATED:    '形成经营判断',
+  ROUTE_RECOMMENDED:   '智脑推荐路线',
+  ROUTE_CONFIRMED:     '路线人工确认',
+  EXECUTION_PREPARED:  '执行准备完成',
+  DISPATCH_CONFIRMED:  '派发正式确认',
+  EXECUTION_STARTED:   '组织执行启动',
+  CHECKPOINT_REACHED:  '到达效果观察点',
+  RESULT_ASSESSED:     '结果评估',
+  JUDGMENT_REVISED:    '判断修订',
+  STABLE_OBSERVATION:  '稳定观察',
+  CLOSE_SUGGESTED:     '建议关闭',
+  CLOSED:              '事项关闭'
+};
+
+/**
+ * 经营结果结论枚举（统一 Result 语义）
+ * 底层只用 `outcome` 这个枚举值作为「业务结论的唯一真相」，页面文案由 Selector 投影
+ * （见 selectors.selectResultVerdict）。禁止在 result / checkpoint 等多处写
+ * 相互冲突的自由文本结论。
+ */
+export const OUTCOMES = {
+  EXCEEDED:          { code: 'EXCEEDED',          label: '超预期' },
+  ON_TRACK:          { code: 'ON_TRACK',          label: '符合预期' },
+  PARTIAL_EFFECT:    { code: 'PARTIAL_EFFECT',    label: '部分有效' },
+  UNDER_EXPECTATION: { code: 'UNDER_EXPECTATION', label: '低于预期' },
+  NO_EFFECT:         { code: 'NO_EFFECT',         label: '基本无效' }
+};
+
+/**
+ * 路线生命周期状态枚举（Route 状态语义拆分）
+ *   - `activeRouteId` 表示「当前正式路线」（当前 = R-A）；
+ *   - `route.status` 表示「路线实际生命周期」：推荐 → 确认 → 执行 → 观察/完成 → 关闭。
+ * 二者解耦：Route A 已执行完并产出 Checkpoint/Result，其 status 不再为 EXECUTING，
+ * 而是 OBSERVED（结果观察中）；Route B 仅被推荐，status 保持 RECOMMENDED。
+ */
+export const ROUTE_STATUSES = {
+  RECOMMENDED:  { code: 'RECOMMENDED',  label: '推荐中（待确认）' },
+  CONFIRMED:    { code: 'CONFIRMED',    label: '已确认' },
+  EXECUTING:    { code: 'EXECUTING',    label: '执行中' },
+  OBSERVED:     { code: 'OBSERVED',     label: '结果观察中' },
+  COMPLETED:    { code: 'COMPLETED',    label: '已完成' },
+  CLOSED:       { code: 'CLOSED',       label: '已关闭' }
+};
+
+/**
+ * 主案例 NI-001：门店短视频经营能力提升
+ * 包含从 07-28 信号发现到 08-07 改道建议的完整经营历史。
+ */
+const NI_001 = {
+  id: 'NI-001',
+  title: '门店短视频经营能力提升',
+  priority: 'hi',                 // hi / mid / low（与导航队列优先级一致）
+  priorityLabel: '高',
+
+  // —— 目标（属于本事项的专项目标，区别于 DASHBOARD.goals 的全局目标） ——
+  goal: {
+    label: '持续经营覆盖率',
+    current: 62,                  // 执行前/当前覆盖率
+    target: 80,                   // 阶段目标
+    unit: '%',
+    deviation: -18,               // 偏离（目标 - 当前）= 80 - 62 = -18
+    impactRegions: 28,            // 影响区域数
+    impactStores: 1536,           // 影响门店数
+    summary: '大量已具备基础条件的门店，尚未跨过“启动 → 持续经营”门槛。这是当前最值得持续经营的瓶颈。'
+  },
+
+  // —— 经营信号（智脑主动发现） ——
+  signal: '已培训门店中，持续经营掉队是当前覆盖缺口的主要来源。建议优先处理掉队门店，提升持续内容产出与分发效率。',
+
+  // —— 当前五态：结果观察 / 改道态 ——
+  // 语义澄清（验收补充）：currentWorkState 表达「用户此刻在页面主要处理什么（工作模式）」，
+  // 而不是「系统最后生成了什么业务对象」。
+  // 当前 Demo 时刻：Route A 已执行 → Checkpoint 到达 → Result 改善不足 →
+  //   Judgment V2 形成 → Route B 被智脑推荐 → 等待用户查看新路线并进入决策。
+  // 该时刻用户仍处在「结果观察 / 改道态」（⑤），故 = RESULT_REVIEW。
+  // 注意：Route B.status = RECOMMENDED、activeRouteId = R-A 均保持不变；
+  // 经营航迹当前节点仍可是「智脑推荐路线 B（待确认）」——Living Route 表达已发生事件，
+  // currentWorkState 表达用户当前工作模式，二者不矛盾。
+  // 只有当用户显式点击「查看新路线并决策」后，才进入 ROUTE_CONFIRMATION（见 store.enterRouteConfirmation）。
+  currentWorkState: WORK_STATES.RESULT_REVIEW.code,
+
+  // —— 当前激活路线：仍为 Route A（Route B 仅被推荐，未正式确认） ——
+  activeRouteId: 'R-A',
+
+  // —— 路线（历史不覆盖，Route A / Route B 共存） ——
+  routes: [
+    {
+      id: 'R-A',
+      name: '扩大内容供给',
+      status: 'OBSERVED',         // 结果观察中（已执行完并产出 Checkpoint / Result，非执行中）
+      recommendedAt: '2026-07-28',
+      confirmedDecisionId: 'HD-ROUTE-A',   // 关联 Human Confirm ①
+      dispatchedDecisionId: 'HD-DISPATCH-A',// 关联 Human Confirm ②
+      // 预期效果（Route A 立项时设定）
+      expected: { coverage: 72, contentSupply: '+30%', storeGmv: '+15%' },
+      // 行动效果投影用：展示态的“已执行动作”文案（源自路线名称）
+      effectActionLabel: '提升内容供给<br>专项行动'
+    },
+    {
+      id: 'R-B',
+      name: '分层提升门店持续经营能力',
+      status: 'RECOMMENDED',      // 仅被推荐，尚未 Human Confirm
+      recommendedAt: '2026-08-07',
+      confirmedDecisionId: null,
+      dispatchedDecisionId: null
+    }
+  ],
+
+  // —— 判断（版本历史，不覆盖；V1 仍保留） ——
+  judgments: [
+    {
+      version: 1,
+      createdAt: '2026-07-28',
+      support: 72,                // 原支持度 %
+      conclusion: '内容供给不足是当前主要瓶颈，扩大内容供给可显著提升覆盖率。',
+      status: 'SUPERSEDED'        // 已被 V2 部分替代，但历史保留
+    },
+    {
+      version: 2,
+      createdAt: '2026-08-07',
+      support: 38,                // 新结果出现后支持度下降
+      conclusion: '内容不足已经不是唯一主要瓶颈，部分门店缺少持续经营机制和激励机制。',
+      status: 'ACTIVE'
+    }
+  ],
+  activeJudgmentVersion: 2,
+
+  // —— 两个人工确认（独立记录，绝不合并） ——
+  humanDecisions: [
+    {
+      id: 'HD-ROUTE-A',
+      type: 'ROUTE_CONFIRMATION',         // ① 确认经营路线：AI 推荐 → 人工确认
+      routeId: 'R-A',
+      decision: '确认采纳 Route A（扩大内容供给）作为当前经营路线',
+      confirmedBy: '董事长',
+      confirmedAt: '2026-07-29',
+      note: '第一次人工确认：路线确认'
+    },
+    {
+      id: 'HD-DISPATCH-A',
+      type: 'DISPATCH_CONFIRMATION',      // ② 正式 Action 派发确认
+      routeId: 'R-A',
+      decision: '确认正式派发 Route A 行动（对象分群 + Owner + 时间 + Evidence 要求 + Checkpoint）',
+      confirmedBy: '董事长',
+      confirmedAt: '2026-07-30',
+      note: '第二次人工确认：派发'
+    }
+  ],
+
+  // —— 行动（Route A 的 3 个真实行动，3/3 已执行） ——
+  actions: [
+    { id: 'A-1', routeId: 'R-A', name: '提升内容供给专项行动', owner: '门店运营组', status: 'EXECUTED', executedAt: '2026-07-30' },
+    { id: 'A-2', routeId: 'R-A', name: '持续发布节奏建立',     owner: '区域督导',   status: 'EXECUTED', executedAt: '2026-07-30' },
+    { id: 'A-3', routeId: 'R-A', name: '正反馈闭环激励',       owner: '激励组',     status: 'EXECUTED', executedAt: '2026-07-30' }
+  ],
+
+  // —— 派发（Route A 的正式派发单） ——
+  dispatches: [
+    {
+      id: 'D-A', routeId: 'R-A', decisionId: 'HD-DISPATCH-A',
+      targetSegment: '掉队门店', owner: '门店运营组',
+      dueAt: '2026-08-06',
+      evidenceRequirement: '发布记录 + 成交记录',
+      checkpointId: 'CP-1'
+    }
+  ],
+
+  // —— 执行（Route A 组织执行窗口） ——
+  executions: [
+    { routeId: 'R-A', startAt: '2026-07-30', endAt: '2026-08-06', executedActions: 3, totalActions: 3 }
+  ],
+
+  // —— 检查点（效果观察点 ①） ——
+  checkpoints: [
+    {
+      id: 'CP-1', routeId: 'R-A', label: 'Checkpoint ①', reachedAt: '2026-08-07',
+      metrics: [
+        { name: '持续经营覆盖率', before: 62,  expected: 72,    actual: 64 },
+        { name: '短视频内容供给', before: 100, expected: '+30%', actual: '108 / +8%' },
+        { name: '内容有效率',     before: '14.2%', expected: '18%', actual: '16.8%' }
+      ],
+      // 行动效果投影补充字段（门店 GMV 口径，区别于覆盖率）
+      storeGmvActual: '+11%',
+      storeGmvSub: '+68 家 · +2.6pp'
+    }
+  ],
+
+  // —— 结果（历史数组，不覆盖） ——
+  results: [
+    {
+      id: 'RES-A', routeId: 'R-A', checkpointId: 'CP-1', assessedAt: '2026-08-07',
+      summary: '覆盖率 62→64（预期 72），内容供给 +8%（预期 +30%）：改善幅度低于目标。',
+      outcome: 'PARTIAL_EFFECT',  // 业务结论唯一真相（枚举）；页面文案由 selectResultVerdict 投影，不再用自由文本结论
+      metrics: [
+        { name: '持续经营覆盖率', before: 62, expected: 72, actual: 64 },
+        { name: '短视频内容供给', before: 100, expected: '+30%', actual: '108 / +8%' },
+        { name: '内容有效率',     before: '14.2%', expected: '18%', actual: '16.8%' }
+      ]
+    }
+  ],
+
+  // —— 下一步（来自当前 RESULT_REVIEW 态） ——
+  nextStep: '优先处理 28 个区域掉队门店，建立持续发布节奏与正反馈闭环；评估 Route B（分层提升持续经营能力）并等待人工确认。',
+
+  // —— 行动效果投影（自由文本，源自 result + nextStep） ——
+  effectNextStep: '建议继续观察<br>7 天',
+  effectNote: '短视频内容供给提升带动门店 GMV 增长，但覆盖率缺口仍大。下一阶段建议：把已验证打法复制到同档位掉队区域，而非继续追加头部门店资源。',
+
+  // —— 导航队列展示字段：仅保留「展示 / 更新时间」类字段 ——
+  // 当前阶段 / 落地率 / 下一步一律由 Selector 从 currentWorkState / executions / routes 推导，
+  // 绝不允许 queueStatus 成为第二套业务状态源（见 selectHomeQueue）。
+  queueStatus: {
+    updated: '2026-08-11 09:30'
+  },
+
+  // —— 经营航迹里程碑（全部历史，不覆盖；仅经营级里程碑） ——
+  milestones: [
+    { id: 'M1',  type: 'SIGNAL_DISCOVERED',     at: '2026-07-28', status: 'done' },
+    { id: 'M2',  type: 'JUDGMENT_CREATED',      at: '2026-07-28', judgmentVersion: 1, status: 'done' },
+    { id: 'M3',  type: 'ROUTE_RECOMMENDED',     at: '2026-07-28', routeId: 'R-A', status: 'done' },
+    { id: 'M4',  type: 'ROUTE_CONFIRMED',       at: '2026-07-29', routeId: 'R-A', decisionId: 'HD-ROUTE-A', status: 'done' },
+    { id: 'M5',  type: 'EXECUTION_PREPARED',    at: '2026-07-30', routeId: 'R-A', status: 'done' },
+    { id: 'M6',  type: 'DISPATCH_CONFIRMED',    at: '2026-07-30', routeId: 'R-A', decisionId: 'HD-DISPATCH-A', status: 'done' },
+    { id: 'M7',  type: 'EXECUTION_STARTED',     at: '2026-07-30', routeId: 'R-A', status: 'done' },
+    { id: 'M8',  type: 'CHECKPOINT_REACHED',    at: '2026-08-07', routeId: 'R-A', checkpointId: 'CP-1', status: 'done' },
+    { id: 'M9',  type: 'RESULT_ASSESSED',       at: '2026-08-07', routeId: 'R-A', resultId: 'RES-A', status: 'done' },
+    { id: 'M10', type: 'JUDGMENT_REVISED',      at: '2026-08-07', judgmentVersion: 2, status: 'done' },
+    { id: 'M11', type: 'ROUTE_RECOMMENDED',     at: '2026-08-07', routeId: 'R-B', status: 'current' }  // Route B 推荐，当前态（待人工确认 = 当前节点）
+  ]
+};
+
+/** 经营导航事项集合（当前仅 NI-001 为完整 canonical；后续事项在此追加） */
+export const NAVIGATION_ITEMS = [NI_001];
+
+// =============================================================
+// Dashboard 级数据（企业经营地图 / 全局 KPI / 全国经营数据）
+// 注意：以下数据不属于单个 Navigation Item，继续留在 Dashboard 层。
+// 已从本对象中移除 hero / effectChain / navQueue —— 它们属于 NI-001 的状态，
+// 现统一由 NAVIGATION_ITEMS + selectors 投影，杜绝重复维护。
+// =============================================================
 export const DASHBOARD = {
   // ---------- 顶部上下文栏 ----------
   context: {
@@ -54,29 +328,12 @@ export const DASHBOARD = {
     cyclePeriod: '2026年7月'
   },
 
-  // ---------- 今日经营导航（首屏 Hero） ----------
-  hero: {
-    badges: [
-      { text: '智脑主动发现', type: 'brand' },
-      { text: '最优优先级',   type: 'risk'  }
-    ],
-    title: '门店短视频经营能力提升',
-    lead: '大量已具备基础条件的门店，尚未跨过“启动 → 持续经营”门槛。这是当前最值得持续经营的瓶颈。',
-    stats: [
-      { label: '当前覆盖率', value: '62%',            delta: '较上期 ↑ 3 个百分点', trend: 'up'      },
-      { label: '目标覆盖率', value: '80%',            delta: '阶段目标',           trend: 'neutral' },
-      { label: '偏离',       value: '-18 个百分点',   delta: '差距仍然较大',       trend: 'down'    },
-      { label: '影响范围',   value: '28 个区域',      delta: '1,536 家门店',       trend: 'neutral' }
-    ],
-    signal: '已培训门店中，持续经营掉队是当前覆盖缺口的主要来源。建议优先处理掉队门店，提升持续内容产出与分发效率。',
-    nextStep: '优先处理 28 个区域掉队门店，建立持续发布节奏与正反馈闭环。'
-  },
-
-  // ---------- 等待决策（首屏右侧） ----------
+  // ---------- 企业级独立决策（真正与 Navigation Item 无关；NI 相关决策改由 selectHomeDecisions 投影） ----------
+  // 注意：原「确认门店短视频经营专项策略（第5版 华北优先）」属于 NI-001 路线域决策，
+  // 已从此处移除 —— 现在由 selectHomeDecisions 从 NI canonical state 投影（如 Route B 推荐 → 确认新经营路线）。
   decisions: [
-    { t: '确认门店短视频经营专项策略（第5版 华北优先）', d: '预计影响：提升覆盖率 +18 个百分点', act: '查看并决策' },
-    { t: '区域资源调度建议（华北 → 华东）',             d: '预计覆盖提升 +6 个百分点，需审批投放预算', act: '查看方案' },
-    { t: '确认直播专项激励预算（8月）',                 d: '预算 280 万元，预计新增 320 家门店参与', act: '查看并确认' }
+    { t: '区域资源调度建议（华北 → 华东）', d: '预计覆盖提升 +6 个百分点，需审批投放预算', act: '查看方案' },
+    { t: '确认直播专项激励预算（8月）',     d: '预算 280 万元，预计新增 320 家门店参与', act: '查看并确认' }
   ],
 
   // ---------- 5 个核心 KPI ----------
@@ -125,15 +382,15 @@ export const DASHBOARD = {
     },
     '销售退款率': {
       human: '成交后退款的金额占成交额的比重，反映履约压力与售后风险。',
-      formula: '销售退款率 = 成交后退款金额 ÷ 成交金额',
+      formula: '销售退款率 = 当前销售周期支付订单中已退款金额 ÷ 当前周期支付 GMV',
       example: '2026 年 7 月约 32%，对应退款约 72.7 万元',
-      scope: '按退款发生时间统计。'
+      scope: '当月销售当月退款率口径：统计当前销售周期支付的订单，其中同期已发生退款的金额 ÷ 当前周期支付 GMV，避免跨期错位退款率。'
     },
     '日均成交门店': {
       human: '统计周期内平均每天至少产生一笔成交的门店数量。',
-      formula: '日均成交门店 = 有成交门店数 ÷ 统计天数',
-      example: '约 907 家 ÷ 30 天 ≈ 108 家/天',
-      scope: '按成交日期统计。'
+      formula: '日均成交门店 = Σ 每日产生支付成交的门店数量 ÷ 统计周期天数',
+      example: '约 907 家（每日成交门店数之和）÷ 30 天 ≈ 108 家/天',
+      scope: '按成交日期统计，分母为统计周期天数。'
     }
   },
 
@@ -189,25 +446,13 @@ export const DASHBOARD = {
     { label: '100分以上', value: 171 }
   ],
 
-  // ---------- 行动效果链路（5 步） ----------
-  effectChain: {
-    steps: [
-      { icon: '👤', label: '已执行动作', value: '提升内容供给<br>专项行动' },
-      { icon: '🎯', label: '预期效果',   value: '门店 GMV<br>+15%' },
-      { icon: '📊', label: '实际结果',   value: '门店 GMV +11%', sub: '+68 家 · +2.6pp' },
-      { icon: '🧠', label: '智能判断',   value: '部分有效' },
-      { icon: '🚩', label: '下一步建议', value: '建议继续观察<br>7 天' }
-    ],
-    note: '短视频内容供给提升带动门店 GMV 增长，但覆盖率缺口仍大。下一阶段建议：把已验证打法复制到同档位掉队区域，而非继续追加头部门店资源。'
-  },
-
-  // ---------- 当前经营目标（当前值 / 目标值 / 偏离） ----------
+  // ---------- 当前经营目标（全局目标，区别于 NI-001.goal 的专项目标） ----------
   goals: [
     { name: '支付成交额',     current: 222.9, target: 300, unit: '万', color: '#1e4fa3', deviation: -74 },
     { name: '门店成交额占比', current: 35,    target: 45,  unit: '%',  color: '#0F6E56', deviation: -10 }
   ],
 
-  // ---------- 经营导航队列 ----------
+  // ---------- 经营导航队列（非 NI-001 的其他经营事项；NI-001 由 selector 投影插入队首） ----------
   queueTabs: [
     { key: 'all',     name: '全部'     },
     { key: 'now',     name: '立即处理 2' },
@@ -215,8 +460,7 @@ export const DASHBOARD = {
     { key: 'watch',   name: '观察中 4'  },
     { key: 'summary', name: '周期汇总 8' }
   ],
-  navQueue: [
-    { pri: 'hi',  name: '门店短视频经营能力提升', signal: '短视频内容供给不足且覆盖偏低',        range: '28 个区域 / 1,536 家门店', stage: '执行中',   rate: '68%', next: '提升内容产出与分发效率',   updated: '2026-08-11 09:30' },
+  queueOthers: [
     { pri: 'mid', name: '区域直播投放效率优化',   signal: '华北区域直播投入产出比偏低',          range: '8 个区域 / 2,208 家门店', stage: '分析中',   rate: '32%', next: '优化投放策略与资源分配',   updated: '2026-08-11 09:28' },
     { pri: 'mid', name: '售后异常率上升趋势拦截', signal: '7月异常售后较6月明显恶化',            range: '全国',                    stage: '观察中',   rate: '—',   next: '定位高频售后原因并拦截',   updated: '2026-08-10 18:00' },
     { pri: 'low', name: '新店开业爬坡支持',       signal: '华南新店内容产出未达基准',            range: '3 个省 / 27 家门店',     stage: '执行中',   rate: '45%', next: '补齐基础内容与培训',       updated: '2026-08-10 16:45' },
